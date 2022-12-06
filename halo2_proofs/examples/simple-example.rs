@@ -26,6 +26,14 @@ trait NumericInstructions<F: Field>: Chip<F> {
         b: Self::Num,
     ) -> Result<Self::Num, Error>;
 
+    /// Returns `c = a + b`.
+    fn add(
+        &self,
+        layouter: impl Layouter<F>,
+        a: Self::Num,
+        b: Self::Num,
+    ) -> Result<Self::Num, Error>;
+
     /// Exposes a number as a public input to the circuit.
     fn expose_public(
         &self,
@@ -63,6 +71,7 @@ struct FieldConfig {
     // This is important when building larger circuits, where columns are used by
     // multiple sets of instructions.
     s_mul: Selector,
+    s_add: Selector,
 }
 
 impl<F: Field> FieldChip<F> {
@@ -116,10 +125,42 @@ impl<F: Field> FieldChip<F> {
             vec![s_mul * (lhs * rhs - out)]
         });
 
+        let s_add = meta.selector();
+
+        meta.create_gate("add", |meta| {
+            // To implement multiplication, we need three advice cells and a selector
+            // cell. We arrange them like so:
+            //
+            // | a0  | a1  | s_mul |
+            // |-----|-----|-------|
+            // | lhs | rhs | s_mul |
+            // | out |     |       |
+            //
+            // Gates may refer to any relative offsets we want, but each distinct
+            // offset adds a cost to the proof. The most common offsets are 0 (the
+            // current row), 1 (the next row), and -1 (the previous row), for which
+            // `Rotation` has specific constructors.
+            let lhs = meta.query_advice(advice[0], Rotation::cur());
+            let rhs = meta.query_advice(advice[1], Rotation::cur());
+            let out = meta.query_advice(advice[0], Rotation::next());
+            let s_add = meta.query_selector(s_add);
+
+            // Finally, we return the polynomial expressions that constrain this gate.
+            // For our multiplication gate, we only need a single polynomial constraint.
+            //
+            // The polynomial expressions returned from `create_gate` will be
+            // constrained by the proving system to equal zero. Our expression
+            // has the following properties:
+            // - When s_mul = 0, any value is allowed in lhs, rhs, and out.
+            // - When s_mul != 0, this constrains lhs * rhs = out.
+            vec![s_add * (lhs + rhs - out)]
+        });
+
         FieldConfig {
             advice,
             instance,
             s_mul,
+            s_add,
         }
     }
 }
@@ -218,6 +259,32 @@ impl<F: Field> NumericInstructions<F> for FieldChip<F> {
         )
     }
 
+    fn add(
+        &self,
+        mut layouter: impl Layouter<F>,
+        a: Self::Num,
+        b: Self::Num,
+    ) -> Result<Self::Num, Error> {
+        let config = self.config();
+
+        layouter.assign_region(
+            || "add",
+            |mut region: Region<'_, F>| {
+                config.s_add.enable(&mut region, 0)?;
+
+                a.0.copy_advice(|| "lhs", &mut region, config.advice[0], 0)?;
+                b.0.copy_advice(|| "rhs", &mut region, config.advice[1], 0)?;
+
+                let value = a.0.value().copied() + b.0.value();
+
+                region
+                    .assign_advice(|| "lhs * rhs", config.advice[0], 1, || value)
+                    .map(Number)
+            },
+        )
+    }
+
+
     fn expose_public(
         &self,
         mut layouter: impl Layouter<F>,
@@ -242,6 +309,7 @@ struct MyCircuit<F: Field> {
     constant: F,
     a: Value<F>,
     b: Value<F>,
+    d: Value<F>,
 }
 
 impl<F: Field> Circuit<F> for MyCircuit<F> {
@@ -281,13 +349,20 @@ impl<F: Field> Circuit<F> for MyCircuit<F> {
         let constant =
             field_chip.load_constant(layouter.namespace(|| "load constant"), self.constant)?;
 
+        let d = field_chip.load_private(layouter.namespace(|| "load d"), self.d)?;
+
         // We only have access to plain multiplication.
         // We could implement our circuit as:
         //     asq  = a*a
         //     bsq  = b*b
         //     absq = asq*bsq
         //     c    = constant*asq*bsq
-        //
+        let asq = field_chip.mul(layouter.namespace(|| "a * a"), a.clone(), a)?;
+        let bsq = field_chip.mul(layouter.namespace(|| "b * b"), b.clone(), b)?;
+        let absq = field_chip.mul(layouter.namespace(|| "ab^2"), asq, bsq)?;
+        let c = field_chip.mul(layouter.namespace(|| "constant * absq"), constant, absq)?;
+        let r = field_chip.add(layouter.namespace(|| "constant * absq + d"), c, d)?;
+
         // but it's more efficient to implement it as:
         //     ab   = a*b
         //     absq = ab^2
@@ -296,13 +371,8 @@ impl<F: Field> Circuit<F> for MyCircuit<F> {
         // let absq = field_chip.mul(layouter.namespace(|| "ab * ab"), ab.clone(), ab)?;
         // let c = field_chip.mul(layouter.namespace(|| "constant * absq"), constant, absq)?;
 
-        let asq = field_chip.mul(layouter.namespace(|| "a * a"), a.clone(), a)?;
-        let bsq = field_chip.mul(layouter.namespace(|| "b * b"), b.clone(), b)?;
-        let absq = field_chip.mul(layouter.namespace(|| "ab^2"), asq, bsq)?;
-        let c = field_chip.mul(layouter.namespace(|| "constant * absq"), constant, absq)?;
-
         // Expose the result as a public input to the circuit.
-        field_chip.expose_public(layouter.namespace(|| "expose c"), c, 0)
+        field_chip.expose_public(layouter.namespace(|| "expose r"), r, 0)
     }
 }
 // ANCHOR_END: circuit
@@ -320,26 +390,24 @@ fn main() {
     let a = Fp::from(2);
     let b = Fp::from(3);
     let c = constant * a.square() * b.square();
+    let d = Fp::from(7);
+    let r = c + d;
 
     // Instantiate the circuit with the private inputs.
     let circuit = MyCircuit {
         constant,
         a: Value::known(a),
         b: Value::known(b),
+        d: Value::known(d), // constant * (a*b)^2 + d
     };
 
     // Arrange the public input. We expose the multiplication result in row 0
     // of the instance column, so we position it there in our public inputs.
-    let public_inputs = &mut vec![c];
+    let public_inputs = &mut vec![r];
 
     // Given the correct public input, our circuit will verify.
     let prover = MockProver::run(k, &circuit, vec![public_inputs.clone()]).unwrap();
     assert_eq!(prover.verify(), Ok(()));
-
-    // If we try some other public input, the proof will fail!
-    public_inputs[0] += Fp::one();
-    let prover = MockProver::run(k, &circuit, vec![(&public_inputs).to_vec()]).unwrap();
-    assert!(prover.verify().is_err());
 
     // If we try some other public input, the proof will fail!
     public_inputs[0] += Fp::one();
