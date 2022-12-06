@@ -292,8 +292,13 @@ impl<F: Field> Circuit<F> for MyCircuit<F> {
         //     ab   = a*b
         //     absq = ab^2
         //     c    = constant*absq
-        let ab = field_chip.mul(layouter.namespace(|| "a * b"), a, b)?;
-        let absq = field_chip.mul(layouter.namespace(|| "ab * ab"), ab.clone(), ab)?;
+        // let ab = field_chip.mul(layouter.namespace(|| "a * b"), a, b)?;
+        // let absq = field_chip.mul(layouter.namespace(|| "ab * ab"), ab.clone(), ab)?;
+        // let c = field_chip.mul(layouter.namespace(|| "constant * absq"), constant, absq)?;
+
+        let asq = field_chip.mul(layouter.namespace(|| "a * a"), a.clone(), a)?;
+        let bsq = field_chip.mul(layouter.namespace(|| "b * b"), b.clone(), b)?;
+        let absq = field_chip.mul(layouter.namespace(|| "ab^2"), asq, bsq)?;
         let c = field_chip.mul(layouter.namespace(|| "constant * absq"), constant, absq)?;
 
         // Expose the result as a public input to the circuit.
@@ -308,10 +313,10 @@ fn main() {
     // ANCHOR: test-circuit
     // The number of rows in our circuit cannot exceed 2^k. Since our example
     // circuit is very small, we can pick a very small value here.
-    let k = 4;
+    let k = 5;
 
     // Prepare the private and public inputs to the circuit!
-    let constant = Fp::from(7);
+    let constant = Fp::from(5);
     let a = Fp::from(2);
     let b = Fp::from(3);
     let c = constant * a.square() * b.square();
@@ -325,7 +330,7 @@ fn main() {
 
     // Arrange the public input. We expose the multiplication result in row 0
     // of the instance column, so we position it there in our public inputs.
-    let mut public_inputs = vec![c];
+    let public_inputs = &mut vec![c];
 
     // Given the correct public input, our circuit will verify.
     let prover = MockProver::run(k, &circuit, vec![public_inputs.clone()]).unwrap();
@@ -333,7 +338,13 @@ fn main() {
 
     // If we try some other public input, the proof will fail!
     public_inputs[0] += Fp::one();
-    let prover = MockProver::run(k, &circuit, vec![public_inputs]).unwrap();
+    let prover = MockProver::run(k, &circuit, vec![(&public_inputs).to_vec()]).unwrap();
     assert!(prover.verify().is_err());
+
+    // If we try some other public input, the proof will fail!
+    public_inputs[0] += Fp::one();
+    let prover = MockProver::run(k, &circuit, vec![(&public_inputs).to_vec()]).unwrap();
+    assert!(prover.verify().is_err());
+
     // ANCHOR_END: test-circuit
 }
