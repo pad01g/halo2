@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
 
+use ff::PrimeField;
 use group::ff::Field;
 use halo2_proofs::{
     circuit::{AssignedCell, Chip, Layouter, Region, SimpleFloorPlanner, Value},
@@ -20,6 +21,14 @@ trait NumericInstructions<F: Field>: Chip<F> {
 
     /// Returns `c = a * b`.
     fn mul(
+        &self,
+        layouter: impl Layouter<F>,
+        a: Self::Num,
+        b: Self::Num,
+    ) -> Result<Self::Num, Error>;
+
+    /// Returns `c = a + b`.
+    fn add(
         &self,
         layouter: impl Layouter<F>,
         a: Self::Num,
@@ -63,6 +72,9 @@ struct FieldConfig {
     // This is important when building larger circuits, where columns are used by
     // multiple sets of instructions.
     s_mul: Selector,
+
+    // plonk selector for addition
+    s_add: Selector,
 }
 
 impl<F: Field> FieldChip<F> {
@@ -116,10 +128,20 @@ impl<F: Field> FieldChip<F> {
             vec![s_mul * (lhs * rhs - out)]
         });
 
+        let s_add = meta.selector();
+        meta.create_gate("add", |meta| {
+            let lhs = meta.query_advice(advice[0], Rotation::cur());
+            let rhs = meta.query_advice(advice[1], Rotation::cur());
+            let out = meta.query_advice(advice[0], Rotation::next());
+            let s_add = meta.query_selector(s_add);
+            vec![s_add * (lhs + rhs - out)]
+        });
+
         FieldConfig {
             advice,
             instance,
             s_mul,
+            s_add,
         }
     }
 }
@@ -218,6 +240,28 @@ impl<F: Field> NumericInstructions<F> for FieldChip<F> {
         )
     }
 
+    fn add(
+        &self,
+        mut layouter: impl Layouter<F>,
+        a: Self::Num,
+        b: Self::Num,
+    ) -> Result<Self::Num, Error> {
+        let config = self.config();
+
+        layouter.assign_region(
+            || "add",
+            |mut region: Region<'_, F>| {
+                config.s_add.enable(&mut region, 0)?;
+                a.0.copy_advice(|| "lhs", &mut region, config.advice[0], 0)?;
+                b.0.copy_advice(|| "rhs", &mut region, config.advice[1], 0)?;
+                let value = a.0.value().copied() + b.0.value();
+                region
+                    .assign_advice(|| "lhs + rhs", config.advice[0], 1, || value)
+                    .map(Number)
+            },
+        )
+    }
+
     fn expose_public(
         &self,
         mut layouter: impl Layouter<F>,
@@ -239,9 +283,10 @@ impl<F: Field> NumericInstructions<F> for FieldChip<F> {
 /// were `None` we would get an error.
 #[derive(Default)]
 struct MyCircuit<F: Field> {
-    constant: F,
     a: Value<F>,
     b: Value<F>,
+    c: Value<F>,
+    constant: F,
 }
 
 impl<F: Field> Circuit<F> for MyCircuit<F> {
@@ -276,28 +321,41 @@ impl<F: Field> Circuit<F> for MyCircuit<F> {
         // Load our private values into the circuit.
         let a = field_chip.load_private(layouter.namespace(|| "load a"), self.a)?;
         let b = field_chip.load_private(layouter.namespace(|| "load b"), self.b)?;
-
-        // Load the constant factor into the circuit.
-        let constant =
+        let c = field_chip.load_private(layouter.namespace(|| "load c"), self.c)?;
+        let val_minus_73 =
             field_chip.load_constant(layouter.namespace(|| "load constant"), self.constant)?;
 
-        // We only have access to plain multiplication.
-        // We could implement our circuit as:
-        //     asq  = a*a
-        //     bsq  = b*b
-        //     absq = asq*bsq
-        //     c    = constant*asq*bsq
-        //
-        // but it's more efficient to implement it as:
-        //     ab   = a*b
-        //     absq = ab^2
-        //     c    = constant*absq
-        let ab = field_chip.mul(layouter.namespace(|| "a * b"), a, b)?;
-        let absq = field_chip.mul(layouter.namespace(|| "ab * ab"), ab.clone(), ab)?;
-        let c = field_chip.mul(layouter.namespace(|| "constant * absq"), constant, absq)?;
+        let ab = field_chip.mul(layouter.namespace(|| "a * b"), a.clone(), b.clone())?;
+        let aab = field_chip.mul(layouter.namespace(|| "a * ab"), a.clone(), ab.clone())?;
+
+        let bc = field_chip.mul(layouter.namespace(|| "b * c"), b.clone(), c.clone())?;
+        let bbc = field_chip.mul(layouter.namespace(|| "b * bc"), b.clone(), bc)?;
+
+        let ca = field_chip.mul(layouter.namespace(|| "b * c"), c.clone(), a.clone())?;
+        let cca = field_chip.mul(layouter.namespace(|| "b * bc"), c.clone(), ca)?;
+
+        let minus_c_73 =
+            field_chip.mul(layouter.namespace(|| "-73 * c"), c.clone(), val_minus_73)?;
+        let minus_abc_73 =
+            field_chip.mul(layouter.namespace(|| "ab * -73c"), ab.clone(), minus_c_73)?;
+
+        let aab_plus_bbc =
+            field_chip.add(layouter.namespace(|| "aab + bbc"), aab.clone(), bbc.clone())?;
+
+        let cca_minus_abc73 = field_chip.add(
+            layouter.namespace(|| "cca - 73abc"),
+            cca.clone(),
+            minus_abc_73.clone(),
+        )?;
+
+        let sum = field_chip.add(
+            layouter.namespace(|| "aab + bbc + cca - 73abc"),
+            aab_plus_bbc.clone(),
+            cca_minus_abc73.clone(),
+        )?;
 
         // Expose the result as a public input to the circuit.
-        field_chip.expose_public(layouter.namespace(|| "expose c"), c, 0)
+        field_chip.expose_public(layouter.namespace(|| "expose sum"), sum, 0)
     }
 }
 // ANCHOR_END: circuit
@@ -308,32 +366,42 @@ fn main() {
     // ANCHOR: test-circuit
     // The number of rows in our circuit cannot exceed 2^k. Since our example
     // circuit is very small, we can pick a very small value here.
-    let k = 4;
+    let k = 5;
 
     // Prepare the private and public inputs to the circuit!
-    let constant = Fp::from(7);
-    let a = Fp::from(2);
-    let b = Fp::from(3);
-    let c = constant * a.square() * b.square();
+    // The inputs are from fruit math meme.
+    // https://np.reddit.com/r/mathmemes/comments/tm4f69/fruit_math_can_you_solve_it_troll_your_friends/
+    let constant = Fp::from(73).neg();
+    let a = Fp::from_str_vartime("723869051938634952455000067289242669675739356");
+    let b = Fp::from_str_vartime("5516052940379835723918624062995170304792670702");
+    let c = Fp::from_str_vartime("11072099852925046330240381983962055577398063");
 
-    // Instantiate the circuit with the private inputs.
-    let circuit = MyCircuit {
-        constant,
-        a: Value::known(a),
-        b: Value::known(b),
-    };
+    match (a, b, c) {
+        (Some(a), Some(b), Some(c)) => {
+            // Instantiate the circuit with the private inputs.
+            let circuit = MyCircuit {
+                a: Value::known(a),
+                b: Value::known(b),
+                c: Value::known(c),
+                constant,
+            };
 
-    // Arrange the public input. We expose the multiplication result in row 0
-    // of the instance column, so we position it there in our public inputs.
-    let mut public_inputs = vec![c];
+            let r = a * a * b + b * b * c + c * c * a + constant * a * b * c;
 
-    // Given the correct public input, our circuit will verify.
-    let prover = MockProver::run(k, &circuit, vec![public_inputs.clone()]).unwrap();
-    assert_eq!(prover.verify(), Ok(()));
+            // Arrange the public input. We expose the multiplication result in row 0
+            // of the instance column, so we position it there in our public inputs.
+            let mut public_inputs = vec![r];
 
-    // If we try some other public input, the proof will fail!
-    public_inputs[0] += Fp::one();
-    let prover = MockProver::run(k, &circuit, vec![public_inputs]).unwrap();
-    assert!(prover.verify().is_err());
-    // ANCHOR_END: test-circuit
+            // Given the correct public input, our circuit will verify.
+            let prover = MockProver::run(k, &circuit, vec![public_inputs.clone()]).unwrap();
+            assert_eq!(prover.verify(), Ok(()));
+
+            // If we try some other public input, the proof will fail!
+            public_inputs[0] += Fp::one();
+            let prover = MockProver::run(k, &circuit, vec![public_inputs]).unwrap();
+            assert!(prover.verify().is_err());
+            // ANCHOR_END: test-circuit
+        }
+        _ => {}
+    }
 }
